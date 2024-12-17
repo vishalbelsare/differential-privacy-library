@@ -14,22 +14,21 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions/setup-python@v2
+    - uses: actions/checkout@v3
+    - uses: actions/setup-python@v4
       with:
-        python-version: 3.9
+        python-version: '3.11'
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        python -m pip install pylint==2.11.1 pycodestyle==2.7.0 pytest-cov
+        python -m pip install pylint==2.15.2 pycodestyle==2.9.1 pytest-cov
         python -m pip install .
         python -m pip list
     - name: Codecov test
       run: |
         pytest --cov-report=xml --cov=diffprivlib --cov-append
     - name: Codecov upload
-      run: echo "Codecov still being uploaded by Travis!"
-#      uses: codecov/codecov-action@v2.1.0
+      uses: codecov/codecov-action@v3
     - name: pycodestyle
       run: pycodestyle --max-line-length=120 diffprivlib
     - name: pylint

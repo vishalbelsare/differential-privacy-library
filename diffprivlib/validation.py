@@ -200,9 +200,22 @@ def clip_to_bounds(array, bounds):
     return clipped_array
 
 
-class DiffprivlibMixin:
+class DiffprivlibMixin:  # pylint: disable=too-few-public-methods
     """Mixin for Diffprivlib models."""
     _check_bounds = staticmethod(check_bounds)
     _clip_to_norm = staticmethod(clip_to_norm)
     _clip_to_bounds = staticmethod(clip_to_bounds)
     _warn_unused_args = staticmethod(warn_unused_args)
+
+    # todo: remove when scikit-learn v1.2 is a min requirement
+    def _validate_params(self):
+        pass
+
+    @staticmethod
+    def _copy_parameter_constraints(cls, *args):
+        """Copies the parameter constraints for `*args` from `cls`
+        """
+        if not hasattr(cls, "_parameter_constraints"):
+            return {}
+
+        return {k: cls._parameter_constraints[k] for k in args if k in cls._parameter_constraints}
