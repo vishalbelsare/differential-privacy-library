@@ -51,17 +51,26 @@ from scipy.optimize import minimize
 from sklearn.utils import check_array
 from sklearn.utils.validation import FLOAT_DTYPES
 
+# TODO: remove when sklearn 1.6 a min req
+try:
+    from sklearn.utils.validation import validate_data
+except ImportError:
+    from sklearn.base import BaseEstimator
+    validate_data = BaseEstimator._validate_data
+
 from diffprivlib.accountant import BudgetAccountant
 from diffprivlib.mechanisms import Laplace, LaplaceFolded
 from diffprivlib.tools import mean
-from diffprivlib.utils import warn_unused_args, PrivacyLeakWarning
+from diffprivlib.utils import warn_unused_args, PrivacyLeakWarning, check_random_state
 from diffprivlib.validation import check_bounds, clip_to_bounds, DiffprivlibMixin
 
 
 # noinspection PyPep8Naming
 def _preprocess_data(X, y, fit_intercept, epsilon=1.0, bounds_X=None, bounds_y=None, copy=True, check_input=True,
-                     **unused_args):
+                     random_state=None, **unused_args):
     warn_unused_args(unused_args)
+
+    random_state = check_random_state(random_state)
 
     if check_input:
         X = check_array(X, copy=copy, accept_sparse=False, dtype=FLOAT_DTYPES)
@@ -78,9 +87,11 @@ def _preprocess_data(X, y, fit_intercept, epsilon=1.0, bounds_X=None, bounds_y=N
         X = clip_to_bounds(X, bounds_X)
         y = clip_to_bounds(y, bounds_y)
 
-        X_offset = mean(X, axis=0, bounds=bounds_X, epsilon=epsilon, accountant=BudgetAccountant())
+        X_offset = mean(X, axis=0, bounds=bounds_X, epsilon=epsilon, random_state=random_state,
+                        accountant=BudgetAccountant())
         X -= X_offset
-        y_offset = mean(y, axis=0, bounds=bounds_y, epsilon=epsilon, accountant=BudgetAccountant())
+        y_offset = mean(y, axis=0, bounds=bounds_y, epsilon=epsilon, random_state=random_state,
+                        accountant=BudgetAccountant())
         y = y - y_offset
     else:
         X_offset = np.zeros(X.shape[1], dtype=X.dtype)
@@ -92,7 +103,7 @@ def _preprocess_data(X, y, fit_intercept, epsilon=1.0, bounds_X=None, bounds_y=N
     return X, y, X_offset, y_offset, X_scale
 
 
-def _construct_regression_obj(X, y, bounds_X, bounds_y, epsilon, alpha):
+def _construct_regression_obj(X, y, bounds_X, bounds_y, epsilon, alpha, random_state):
     if y.ndim == 1:
         y = y.reshape(-1, 1)
 
@@ -113,7 +124,8 @@ def _construct_regression_obj(X, y, bounds_X, bounds_y, epsilon, alpha):
 
     for i in range(n_targets):
         sensitivity = np.abs([bounds_y[0][i], bounds_y[1][i]]).max() ** 2
-        mech = LaplaceFolded(epsilon=local_epsilon, sensitivity=sensitivity, lower=0, upper=float("inf"))
+        mech = LaplaceFolded(epsilon=local_epsilon, sensitivity=sensitivity, lower=0, upper=float("inf"),
+                             random_state=random_state)
         mono_coef_0[i] = mech.randomise(coefs[0][i])
 
     # Randomise 1st-degree monomial coefficients
@@ -122,7 +134,7 @@ def _construct_regression_obj(X, y, bounds_X, bounds_y, epsilon, alpha):
     for i in range(n_targets):
         for j in range(n_features):
             sensitivity = get_max_sensitivity(bounds_y[0][i], bounds_y[1][i], bounds_X[0][j], bounds_X[1][j])
-            mech = Laplace(epsilon=local_epsilon, sensitivity=sensitivity)
+            mech = Laplace(epsilon=local_epsilon, sensitivity=sensitivity, random_state=random_state)
             mono_coef_1[j, i] = mech.randomise(coefs[1][j, i])
 
     # Randomise 2nd-degree monomial coefficients
@@ -130,12 +142,13 @@ def _construct_regression_obj(X, y, bounds_X, bounds_y, epsilon, alpha):
 
     for i in range(n_features):
         sensitivity = np.max(np.abs([bounds_X[0][i], bounds_X[0][i]])) ** 2
-        mech = LaplaceFolded(epsilon=local_epsilon, sensitivity=sensitivity, lower=0, upper=float("inf"))
+        mech = LaplaceFolded(epsilon=local_epsilon, sensitivity=sensitivity, lower=0, upper=float("inf"),
+                             random_state=random_state)
         mono_coef_2[i, i] = mech.randomise(coefs[2][i, i])
 
         for j in range(i + 1, n_features):
             sensitivity = get_max_sensitivity(bounds_X[0][i], bounds_X[1][i], bounds_X[0][j], bounds_X[1][j])
-            mech = Laplace(epsilon=local_epsilon, sensitivity=sensitivity)
+            mech = Laplace(epsilon=local_epsilon, sensitivity=sensitivity, random_state=random_state)
             mono_coef_2[i, j] = mech.randomise(coefs[2][i, j])
             mono_coef_2[j, i] = mono_coef_2[i, j]  # Enforce symmetry
 
@@ -177,7 +190,7 @@ class LinearRegression(sk_lr.LinearRegression, DiffprivlibMixin):
     epsilon : float, default: 1.0
         Privacy parameter :math:`\epsilon`.
 
-    bounds_X:  tuple
+    bounds_X :  tuple
         Bounds of the data, provided as a tuple of the form (min, max).  `min` and `max` can either be scalars, covering
         the min/max of the entire data, or vectors with one entry per feature.  If not provided, the bounds are computed
         on the data when ``.fit()`` is first called, resulting in a :class:`.PrivacyLeakWarning`.
@@ -191,6 +204,10 @@ class LinearRegression(sk_lr.LinearRegression, DiffprivlibMixin):
 
     copy_X : bool, default: True
         If True, X will be copied; else, it may be overwritten.
+
+    random_state : int or RandomState, optional
+        Controls the randomness of the model.  To obtain a deterministic behaviour during randomisation,
+        ``random_state`` has to be fixed to an integer.
 
     accountant : BudgetAccountant, optional
         Accountant to keep track of privacy budget.
@@ -211,13 +228,18 @@ class LinearRegression(sk_lr.LinearRegression, DiffprivlibMixin):
         regression analysis under differential privacy." arXiv preprint arXiv:1208.0219 (2012).
 
     """
-    def __init__(self, *, epsilon=1.0, bounds_X=None, bounds_y=None, fit_intercept=True, copy_X=True, accountant=None,
-                 **unused_args):
+
+    _parameter_constraints = DiffprivlibMixin._copy_parameter_constraints(
+        sk_lr.LinearRegression, "fit_intercept", "copy_X")
+
+    def __init__(self, *, epsilon=1.0, bounds_X=None, bounds_y=None, fit_intercept=True, copy_X=True, random_state=None,
+                 accountant=None, **unused_args):
         super().__init__(fit_intercept=fit_intercept, copy_X=copy_X, n_jobs=None)
 
         self.epsilon = epsilon
         self.bounds_X = bounds_X
         self.bounds_y = bounds_y
+        self.random_state = random_state
         self.accountant = BudgetAccountant.load_default(accountant)
 
         self._warn_unused_args(unused_args)
@@ -242,12 +264,15 @@ class LinearRegression(sk_lr.LinearRegression, DiffprivlibMixin):
         self : returns an instance of self.
 
         """
+        self._validate_params()
         self.accountant.check(self.epsilon, 0)
 
         if sample_weight is not None:
             self._warn_unused_args("sample_weight")
 
-        X, y = self._validate_data(X, y, accept_sparse=False, y_numeric=True, multi_output=True)
+        random_state = check_random_state(self.random_state)
+
+        X, y = validate_data(self, X, y, accept_sparse=False, y_numeric=True, multi_output=True)
 
         if self.bounds_X is None or self.bounds_y is None:
             warnings.warn(
@@ -262,6 +287,7 @@ class LinearRegression(sk_lr.LinearRegression, DiffprivlibMixin):
             if self.bounds_y is None:
                 self.bounds_y = (np.min(y, axis=0), np.max(y, axis=0))
 
+        # pylint: disable=no-member
         self.bounds_X = self._check_bounds(self.bounds_X, X.shape[1])
         self.bounds_y = self._check_bounds(self.bounds_y, y.shape[1] if y.ndim > 1 else 1)
 
@@ -271,28 +297,25 @@ class LinearRegression(sk_lr.LinearRegression, DiffprivlibMixin):
 
         X, y, X_offset, y_offset, X_scale = self._preprocess_data(
             X, y, fit_intercept=self.fit_intercept, bounds_X=self.bounds_X, bounds_y=self.bounds_y,
-            epsilon=self.epsilon * epsilon_intercept_scale, copy=self.copy_X)
+            epsilon=self.epsilon * epsilon_intercept_scale, copy=self.copy_X, random_state=random_state)
 
         bounds_X = (self.bounds_X[0] - X_offset, self.bounds_X[1] - X_offset)
         bounds_y = (self.bounds_y[0] - y_offset, self.bounds_y[1] - y_offset)
 
         objs, obj_coefs = _construct_regression_obj(
-            X, y, bounds_X, bounds_y, epsilon=self.epsilon * (1 - epsilon_intercept_scale), alpha=0)
+            X, y, bounds_X, bounds_y, epsilon=self.epsilon * (1 - epsilon_intercept_scale), alpha=0,
+            random_state=random_state)
         coef = np.zeros((n_features, n_targets))
-        residues = []
 
         for i, obj in enumerate(objs):
             opt_result = minimize(obj, np.zeros(n_features), jac=True)
             coef[:, i] = opt_result.x
-            residues += [opt_result.fun]
 
         self.coef_ = coef.T
-        self._residues = residues
         self._obj_coefs = obj_coefs
 
         if y.ndim == 1:
             self.coef_ = np.ravel(self.coef_)
-            self._residues = self._residues[0]
         self._set_intercept(X_offset, y_offset, X_scale)
 
         self.accountant.spend(self.epsilon, 0)

@@ -3,7 +3,7 @@ from unittest import TestCase
 
 from diffprivlib.accountant import BudgetAccountant
 from diffprivlib.tools.histograms import histogram2d
-from diffprivlib.utils import global_seed, PrivacyLeakWarning, BudgetError
+from diffprivlib.utils import PrivacyLeakWarning, BudgetError, check_random_state
 
 
 class TestHistogram2d(TestCase):
@@ -50,7 +50,6 @@ class TestHistogram2d(TestCase):
         self.assertTrue((edges_y == dp_edges_y).all())
 
     def test_different_result(self):
-        global_seed(3141592653)
         x = np.array([1, 2, 3, 4, 5])
         y = np.array([5, 7, 1, 5, 9])
         hist, _, _ = np.histogram2d(x, y, bins=3, range=[(0, 10), (0, 10)])
@@ -61,10 +60,11 @@ class TestHistogram2d(TestCase):
         self.assertTrue((hist != dp_hist).any())
 
     def test_density(self):
-        global_seed(3141592653)
+        rng = check_random_state(1)
+
         x = np.array([1, 2, 3, 4, 5])
         y = np.array([5, 7, 1, 5, 9])
-        dp_hist, _, _ = histogram2d(x, y, epsilon=1, bins=3, range=[(0, 10), (0, 10)], density=True)
+        dp_hist, _, _ = histogram2d(x, y, epsilon=1, bins=3, range=[(0, 10), (0, 10)], density=True, random_state=rng)
 
         # print(dp_hist.sum())
 

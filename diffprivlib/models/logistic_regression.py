@@ -51,14 +51,21 @@ from joblib import delayed, Parallel
 from scipy import optimize
 from sklearn.exceptions import ConvergenceWarning
 from sklearn import linear_model
-from sklearn.linear_model._logistic import _logistic_loss_and_grad
 from sklearn.utils import check_array, check_consistent_length
-from sklearn.utils.fixes import _joblib_parallel_args
 from sklearn.utils.multiclass import check_classification_targets
+from sklearn.linear_model._linear_loss import LinearModelLoss
+from sklearn._loss import HalfBinomialLoss
+
+# TODO: remove when sklearn v1.6 a min req
+try:
+    from sklearn.utils.validation import validate_data
+except ImportError:
+    from sklearn.base import BaseEstimator
+    validate_data = BaseEstimator._validate_data
 
 from diffprivlib.accountant import BudgetAccountant
 from diffprivlib.mechanisms import Vector
-from diffprivlib.utils import PrivacyLeakWarning, DiffprivlibCompatibilityWarning, warn_unused_args
+from diffprivlib.utils import PrivacyLeakWarning, warn_unused_args, check_random_state
 from diffprivlib.validation import DiffprivlibMixin
 
 
@@ -117,6 +124,10 @@ class LogisticRegression(linear_model.LogisticRegression, DiffprivlibMixin):
         Number of CPU cores used when parallelising over classes.  ``None`` means 1 unless in a context. ``-1`` means
         using all processors.
 
+    random_state : int or RandomState, optional
+        Controls the randomness of the model.  To obtain a deterministic behaviour during randomisation,
+        ``random_state`` has to be fixed to an integer.
+
     accountant : BudgetAccountant, optional
         Accountant to keep track of privacy budget.
 
@@ -166,11 +177,15 @@ class LogisticRegression(linear_model.LogisticRegression, DiffprivlibMixin):
 
     """
 
+    _parameter_constraints = DiffprivlibMixin._copy_parameter_constraints(
+        linear_model.LogisticRegression, "tol", "C", "fit_intercept", "max_iter", "verbose", "warm_start", "n_jobs",
+        "random_state")
+
     def __init__(self, *, epsilon=1.0, data_norm=None, tol=1e-4, C=1.0, fit_intercept=True, max_iter=100, verbose=0,
-                 warm_start=False, n_jobs=None, accountant=None, **unused_args):
+                 warm_start=False, n_jobs=None, random_state=None, accountant=None, **unused_args):
         super().__init__(penalty='l2', dual=False, tol=tol, C=C, fit_intercept=fit_intercept, intercept_scaling=1.0,
-                         class_weight=None, random_state=None, solver='lbfgs', max_iter=max_iter, multi_class='ovr',
-                         verbose=verbose, warm_start=warm_start, n_jobs=n_jobs)
+                         class_weight=None, random_state=random_state, solver='lbfgs', max_iter=max_iter,
+                         multi_class='ovr', verbose=verbose, warm_start=warm_start, n_jobs=n_jobs)
         self.epsilon = epsilon
         self.data_norm = data_norm
         self.classes_ = None
@@ -198,21 +213,16 @@ class LogisticRegression(linear_model.LogisticRegression, DiffprivlibMixin):
         self : class
 
         """
+        self._validate_params()
         self.accountant.check(self.epsilon, 0)
 
         if sample_weight is not None:
             self._warn_unused_args("sample_weight")
 
-        if not isinstance(self.C, numbers.Real) or self.C < 0:
-            raise ValueError(f"Penalty term must be positive; got (C={self.C})")
-        if not isinstance(self.max_iter, numbers.Integral) or self.max_iter < 0:
-            raise ValueError(f"Maximum number of iteration must be positive; got (max_iter={self.max_iter})")
-        if not isinstance(self.tol, numbers.Real) or self.tol < 0:
-            raise ValueError(f"Tolerance for stopping criteria must be positive; got (tol={self.tol})")
+        random_state = check_random_state(self.random_state)
 
-        solver = _check_solver(self.solver, self.penalty, self.dual)
-        X, y = self._validate_data(X, y, accept_sparse='csr', dtype=float, order="C",
-                                   accept_large_sparse=solver != 'liblinear')
+        X, y = validate_data(self, X, y, accept_sparse='csr', dtype=float, order="C",
+                             accept_large_sparse=True)
         check_classification_targets(y)
         self.classes_ = np.unique(y)
         _, n_features = X.shape
@@ -224,8 +234,6 @@ class LogisticRegression(linear_model.LogisticRegression, DiffprivlibMixin):
             self.data_norm = np.linalg.norm(X, axis=1).max()
 
         X = self._clip_to_norm(X, self.data_norm)
-
-        self.multi_class = _check_multi_class(self.multi_class, solver, len(self.classes_))
 
         n_classes = len(self.classes_)
         classes_ = self.classes_
@@ -252,10 +260,10 @@ class LogisticRegression(linear_model.LogisticRegression, DiffprivlibMixin):
 
         path_func = delayed(_logistic_regression_path)
 
-        fold_coefs_ = Parallel(n_jobs=self.n_jobs, verbose=self.verbose, **_joblib_parallel_args(prefer='processes'))(
+        fold_coefs_ = Parallel(n_jobs=self.n_jobs, verbose=self.verbose, prefer='processes')(
             path_func(X, y, epsilon=self.epsilon / n_classes, data_norm=self.data_norm, pos_class=class_, Cs=[self.C],
                       fit_intercept=self.fit_intercept, max_iter=self.max_iter, tol=self.tol, verbose=self.verbose,
-                      coef=warm_start_coef_, check_input=False)
+                      coef=warm_start_coef_, random_state=random_state, check_input=False)
             for class_, warm_start_coef_ in zip(classes_, warm_start_coef))
 
         fold_coefs_, _, n_iter_ = zip(*fold_coefs_)
@@ -274,7 +282,7 @@ class LogisticRegression(linear_model.LogisticRegression, DiffprivlibMixin):
 
 
 def _logistic_regression_path(X, y, epsilon, data_norm, pos_class=None, Cs=10, fit_intercept=True, max_iter=100,
-                              tol=1e-4, verbose=0, coef=None, check_input=True, **unused_args):
+                              tol=1e-4, verbose=0, coef=None, random_state=None, check_input=True, **unused_args):
     """Compute a Logistic Regression model with differential privacy for a list of regularization parameters.  Takes
     inspiration from ``_logistic_regression_path`` in scikit-learn, specified to the LBFGS solver and one-vs-rest
     multi class fitting.
@@ -318,6 +326,10 @@ def _logistic_regression_path(X, y, epsilon, data_norm, pos_class=None, Cs=10, f
     coef : array-like, shape (n_features,), optional
         Initialization value for coefficients of logistic regression.  Useless for liblinear solver.
 
+    random_state : int or RandomState, optional
+        Controls the randomness of the model.  To obtain a deterministic behaviour during randomisation,
+        ``random_state`` has to be fixed to an integer.
+
     check_input : bool, default: True
         If False, the input arrays X and y will not be checked.
 
@@ -337,10 +349,10 @@ def _logistic_regression_path(X, y, epsilon, data_norm, pos_class=None, Cs=10, f
     """
     warn_unused_args(unused_args)
 
+    random_state = check_random_state(random_state)
+
     if isinstance(Cs, numbers.Integral):
         Cs = np.logspace(-4, 4, int(Cs))
-
-    solver = 'lbfgs'
 
     # Data norm increases if intercept is included
     if fit_intercept:
@@ -348,10 +360,10 @@ def _logistic_regression_path(X, y, epsilon, data_norm, pos_class=None, Cs=10, f
 
     # Pre-processing.
     if check_input:
-        X = check_array(X, accept_sparse='csr', dtype=np.float64, accept_large_sparse=solver != 'liblinear')
+        X = check_array(X, accept_sparse='csr', dtype=np.float64, accept_large_sparse=True)
         y = check_array(y, ensure_2d=False, dtype=None)
         check_consistent_length(X, y)
-    _, n_features = X.shape
+    n_samples, n_features = X.shape
 
     classes = np.unique(y)
 
@@ -363,12 +375,11 @@ def _logistic_regression_path(X, y, epsilon, data_norm, pos_class=None, Cs=10, f
 
     sample_weight = np.ones(X.shape[0], dtype=X.dtype)
 
-    # For doing a ovr, we need to mask the labels first.
+    # For doing an ovr, we need to mask the labels first.
     output_vec = np.zeros(n_features + int(fit_intercept), dtype=X.dtype)
     mask = (y == pos_class)
     y_bin = np.ones(y.shape, dtype=X.dtype)
-    y_bin[~mask] = -1.
-    # for compute_class_weight
+    y_bin[~mask] = 0.0
 
     if coef is not None:
         # it must work both giving the bias term and not
@@ -378,18 +389,21 @@ def _logistic_regression_path(X, y, epsilon, data_norm, pos_class=None, Cs=10, f
         output_vec[:coef.size] = coef
 
     target = y_bin
+    func = LinearModelLoss(base_loss=HalfBinomialLoss(), fit_intercept=fit_intercept).loss_gradient
 
     coefs = []
     n_iter = np.zeros(len(Cs), dtype=np.int32)
     for i, C in enumerate(Cs):
-        vector_mech = Vector(epsilon=epsilon, dimension=n_features + int(fit_intercept), alpha=1. / C,
-                             function_sensitivity=0.25, data_sensitivity=data_norm)
-        noisy_logistic_loss = vector_mech.randomise(_logistic_loss_and_grad)
+        l2_reg_strength = 1.0 / (C * n_samples)
+        vector_mech = Vector(epsilon=epsilon, dimension=n_features + int(fit_intercept), alpha=1.0 / C,
+                             function_sensitivity=0.25, data_sensitivity=data_norm, n=n_samples,
+                             random_state=random_state)
+        noisy_logistic_loss = vector_mech.randomise(func)
 
+        args = (X, target, sample_weight, l2_reg_strength)
         iprint = [-1, 50, 1, 100, 101][np.searchsorted(np.array([0, 1, 2, 3]), verbose)]
-        output_vec, _, info = optimize.fmin_l_bfgs_b(noisy_logistic_loss, output_vec, fprime=None,
-                                                     args=(X, target, 1. / C, sample_weight), iprint=iprint, pgtol=tol,
-                                                     maxiter=max_iter)
+        output_vec, _, info = optimize.fmin_l_bfgs_b(noisy_logistic_loss, output_vec, fprime=None, factr=64, args=args,
+                                                     iprint=iprint, pgtol=tol, maxiter=max_iter)
         if info["warnflag"] == 1:
             warnings.warn("lbfgs failed to converge. Increase the number of iterations.", ConvergenceWarning)
 
@@ -398,26 +412,3 @@ def _logistic_regression_path(X, y, epsilon, data_norm, pos_class=None, Cs=10, f
         n_iter[i] = info['nit']
 
     return np.array(coefs), np.array(Cs), n_iter
-
-
-def _check_solver(solver, penalty, dual):
-    if solver != 'lbfgs':
-        warnings.warn("For diffprivlib, solver must be 'lbfgs'.", DiffprivlibCompatibilityWarning)
-        solver = 'lbfgs'
-
-    if penalty != 'l2':
-        raise ValueError(f"Solver {solver} supports only l2 penalties, got {penalty} penalty.")
-    if dual:
-        raise ValueError(f"Solver {solver} supports only dual=False, got dual={dual}")
-    return solver
-
-
-def _check_multi_class(multi_class, solver, n_classes):
-    del solver, n_classes
-
-    if multi_class != 'ovr':
-        warnings.warn(f"For diffprivlib, multi_class must be 'ovr', got {multi_class}.",
-                      DiffprivlibCompatibilityWarning)
-        multi_class = 'ovr'
-
-    return multi_class

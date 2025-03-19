@@ -24,9 +24,16 @@ import numpy as np
 import sklearn.naive_bayes as sk_nb
 from sklearn.utils.multiclass import _check_partial_fit_first_call
 
+# TODO: remove when sklearn 1.6 a min req
+try:
+    from sklearn.utils.validation import validate_data
+except ImportError:
+    from sklearn.base import BaseEstimator
+    validate_data = BaseEstimator._validate_data
+
 from diffprivlib.accountant import BudgetAccountant
 from diffprivlib.mechanisms import LaplaceBoundedDomain, GeometricTruncated, LaplaceTruncated
-from diffprivlib.utils import PrivacyLeakWarning, warn_unused_args
+from diffprivlib.utils import PrivacyLeakWarning, warn_unused_args, check_random_state
 from diffprivlib.validation import DiffprivlibMixin
 
 
@@ -41,7 +48,7 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
     epsilon : float, default: 1.0
         Privacy parameter :math:`\epsilon` for the model.
 
-    bounds:  tuple, optional
+    bounds :  tuple, optional
         Bounds of the data, provided as a tuple of the form (min, max).  `min` and `max` can either be scalars, covering
         the min/max of the entire data, or vectors with one entry per feature.  If not provided, the bounds are computed
         on the data when ``.fit()`` is first called, resulting in a :class:`.PrivacyLeakWarning`.
@@ -51,6 +58,10 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
 
     var_smoothing : float, default: 1e-9
         Portion of the largest variance of all features that is added to variances for calculation stability.
+
+    random_state : int or RandomState, optional
+        Controls the randomness of the model.  To obtain a deterministic behaviour during randomisation,
+        ``random_state`` has to be fixed to an integer.
 
     accountant : BudgetAccountant, optional
         Accountant to keep track of privacy budget.
@@ -80,11 +91,13 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
 
     """
 
-    def __init__(self, *, epsilon=1.0, bounds=None, priors=None, var_smoothing=1e-9, accountant=None):
+    def __init__(self, *, epsilon=1.0, bounds=None, priors=None, var_smoothing=1e-9, random_state=None,
+                 accountant=None):
         super().__init__(priors=priors, var_smoothing=var_smoothing)
 
         self.epsilon = epsilon
         self.bounds = bounds
+        self.random_state = random_state
         self.accountant = BudgetAccountant.load_default(accountant)
 
     def _partial_fit(self, X, y, classes=None, _refit=False, sample_weight=None):
@@ -93,7 +106,9 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
         if sample_weight is not None:
             warn_unused_args("sample_weight")
 
-        X, y = self._validate_data(X, y)
+        random_state = check_random_state(self.random_state)
+
+        X, y = validate_data(self, X, y)
 
         if self.bounds is None:
             warnings.warn("Bounds have not been specified and will be calculated on the data provided. This will "
@@ -140,13 +155,13 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
         classes = self.classes_
 
         unique_y = np.unique(y)
-        unique_y_in_classes = np.in1d(unique_y, classes)
+        unique_y_in_classes = np.isin(unique_y, classes)
 
         if not np.all(unique_y_in_classes):
             raise ValueError(f"The target label(s) {unique_y[~unique_y_in_classes]} in y do not exist in the initial "
                              f"classes {classes}")
 
-        noisy_class_counts = self._noisy_class_counts(y)
+        noisy_class_counts = self._noisy_class_counts(y, random_state=random_state)
 
         for _i, y_i in enumerate(unique_y):
             i = classes.searchsorted(y_i)
@@ -154,8 +169,8 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
 
             n_i = noisy_class_counts[_i]
 
-            new_theta, new_var = self._update_mean_variance(self.class_count_[i], self.theta_[i, :],
-                                                            self.var_[i, :], X_i, n_noisy=n_i)
+            new_theta, new_var = self._update_mean_variance(self.class_count_[i], self.theta_[i, :], self.var_[i, :],
+                                                            X_i, random_state=random_state, n_noisy=n_i)
 
             self.theta_[i, :] = new_theta
             self.var_[i, :] = new_var
@@ -172,7 +187,7 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
 
         return self
 
-    def _update_mean_variance(self, n_past, mu, var, X, sample_weight=None, n_noisy=None):
+    def _update_mean_variance(self, n_past, mu, var, X, random_state, sample_weight=None, n_noisy=None):
         """Compute online update of Gaussian mean and variance.
 
         Given starting sample count, mean, and variance, a new set of points X return the updated mean and variance.
@@ -196,6 +211,10 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
 
         var : array-like, shape (number of Gaussians,)
             Variances for Gaussians in original set.
+
+        random_state : RandomState
+            Controls the randomness of the model.  To obtain a deterministic behaviour during randomisation,
+            ``random_state`` has to be fixed to an integer.
 
         sample_weight : ignored
             Ignored in diffprivlib.
@@ -235,12 +254,12 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
             local_diameter = upper - lower
 
             mech_mu = LaplaceTruncated(epsilon=local_epsilon, delta=0, sensitivity=local_diameter,
-                                       lower=lower * n_noisy, upper=upper * n_noisy)
+                                       lower=lower * n_noisy, upper=upper * n_noisy, random_state=random_state)
             _mu = mech_mu.randomise(temp_x.sum()) / n_noisy
 
             local_sq_sens = max(_mu - lower, upper - _mu) ** 2
             mech_var = LaplaceBoundedDomain(epsilon=local_epsilon, delta=0, sensitivity=local_sq_sens, lower=0,
-                                            upper=local_sq_sens * n_noisy)
+                                            upper=local_sq_sens * n_noisy, random_state=random_state)
             _var = mech_var.randomise(((temp_x - _mu) ** 2).sum()) / n_noisy
 
             new_mu[feature] = _mu
@@ -265,12 +284,13 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
 
         return total_mu, total_var
 
-    def _noisy_class_counts(self, y):
+    def _noisy_class_counts(self, y, random_state):
         unique_y = np.unique(y)
         n_total = y.shape[0]
 
         # Use 1/3 of total epsilon budget for getting noisy class counts
-        mech = GeometricTruncated(epsilon=self.epsilon / 3, sensitivity=1, lower=1, upper=n_total)
+        mech = GeometricTruncated(epsilon=self.epsilon / 3, sensitivity=1, lower=1, upper=n_total,
+                                  random_state=random_state)
         noisy_counts = np.array([mech.randomise((y == y_i).sum()) for y_i in unique_y])
 
         argsort = np.argsort(noisy_counts)
@@ -284,9 +304,3 @@ class GaussianNB(sk_nb.GaussianNB, DiffprivlibMixin):
             i = (i - sgn) % len(unique_y)
 
         return noisy_counts
-
-    @property
-    def sigma_(self):
-        """Variance of each feature per class."""
-        # Todo: Consider removing when sklearn v1.0 is required
-        return self.var_

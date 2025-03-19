@@ -49,13 +49,20 @@ import numpy as np
 import sklearn.preprocessing as sk_pp
 from sklearn.preprocessing._data import _handle_zeros_in_scale
 
+# TODO: remove when sklearn 1.6 a min req
+try:
+    from sklearn.utils.validation import validate_data
+except ImportError:
+    from sklearn.base import BaseEstimator
+    validate_data = BaseEstimator._validate_data
+
 from diffprivlib.accountant import BudgetAccountant
-from diffprivlib.utils import PrivacyLeakWarning
+from diffprivlib.utils import PrivacyLeakWarning, check_random_state
 from diffprivlib.tools import nanvar, nanmean
 from diffprivlib.validation import DiffprivlibMixin
 
 
-def _incremental_mean_and_var(X, epsilon, bounds, last_mean, last_variance, last_sample_count):
+def _incremental_mean_and_var(X, epsilon, bounds, last_mean, last_variance, last_sample_count, random_state=None):
     # Initialising new accountant, as budget is tracked in main class. Subject to review in line with GH issue #21
     temp_acc = BudgetAccountant()
 
@@ -64,7 +71,7 @@ def _incremental_mean_and_var(X, epsilon, bounds, last_mean, last_variance, last
     # updated = the aggregated stats
     last_sum = last_mean * last_sample_count
 
-    new_mean = nanmean(X, epsilon=epsilon, axis=0, bounds=bounds, accountant=temp_acc)
+    new_mean = nanmean(X, epsilon=epsilon, axis=0, bounds=bounds, random_state=random_state, accountant=temp_acc)
     new_sample_count = np.sum(~np.isnan(X), axis=0)
     new_sum = new_mean * new_sample_count
     updated_sample_count = last_sample_count + new_sample_count
@@ -74,7 +81,7 @@ def _incremental_mean_and_var(X, epsilon, bounds, last_mean, last_variance, last
     if last_variance is None:
         updated_variance = None
     else:
-        new_unnormalized_variance = nanvar(X, epsilon=epsilon, axis=0, bounds=bounds,
+        new_unnormalized_variance = nanvar(X, epsilon=epsilon, axis=0, bounds=bounds, random_state=random_state,
                                            accountant=temp_acc) * new_sample_count
         last_unnormalized_variance = last_variance * last_sample_count
 
@@ -113,12 +120,12 @@ class StandardScaler(sk_pp.StandardScaler, DiffprivlibMixin):
 
     Parameters
     ----------
-    epsilon: float, default: 1.0
+    epsilon : float, default: 1.0
         The privacy budget to be allocated to learning the mean and variance of the training sample.  If
         `with_std=True`,  the privacy budget is split evenly between mean and variance (the mean must be calculated even
         when `with_mean=False`, as it is used in the calculation of the variance.
 
-    bounds:  tuple, optional
+    bounds : tuple, optional
         Bounds of the data, provided as a tuple of the form (min, max).  `min` and `max` can either be scalars, covering
         the min/max of the entire data, or vectors with one entry per feature.  If not provided, the bounds are computed
         on the data when ``.fit()`` is first called, resulting in a :class:`.PrivacyLeakWarning`.
@@ -132,6 +139,10 @@ class StandardScaler(sk_pp.StandardScaler, DiffprivlibMixin):
 
     with_std : boolean, True by default
         If True, scale the data to unit variance (or equivalently, unit standard deviation).
+
+    random_state : int or RandomState, optional
+        Controls the randomness of the model.  To obtain a deterministic behaviour during randomisation,
+        ``random_state`` has to be fixed to an integer.
 
     accountant : BudgetAccountant, optional
         Accountant to keep track of privacy budget.
@@ -167,10 +178,12 @@ class StandardScaler(sk_pp.StandardScaler, DiffprivlibMixin):
     NaNs are treated as missing values: disregarded in fit, and maintained in transform.
 
     """  # noqa
-    def __init__(self, *, epsilon=1.0, bounds=None, copy=True, with_mean=True, with_std=True, accountant=None):
+    def __init__(self, *, epsilon=1.0, bounds=None, copy=True, with_mean=True, with_std=True, random_state=None,
+                 accountant=None):
         super().__init__(copy=copy, with_mean=with_mean, with_std=with_std)
         self.epsilon = epsilon
         self.bounds = bounds
+        self.random_state = random_state
         self.accountant = BudgetAccountant.load_default(accountant)
 
     def partial_fit(self, X, y=None, sample_weight=None):
@@ -194,15 +207,17 @@ class StandardScaler(sk_pp.StandardScaler, DiffprivlibMixin):
             Ignored by diffprivlib.  Present for consistency with sklearn API.
 
         """
+        self._validate_params()
         self.accountant.check(self.epsilon, 0)
 
         if sample_weight is not None:
             self._warn_unused_args("sample_weight")
 
+        random_state = check_random_state(self.random_state)
+
         epsilon_0 = self.epsilon / 2 if self.with_std else self.epsilon
 
-        X = self._validate_data(X, accept_sparse=False, copy=self.copy, estimator=self, dtype=float,
-                                force_all_finite='allow-nan')
+        X = validate_data(self, X, accept_sparse=False, copy=self.copy, estimator=self, dtype=float)
 
         if self.bounds is None:
             warnings.warn("Bounds parameter hasn't been specified, so falling back to determining bounds from the "
@@ -239,7 +254,7 @@ class StandardScaler(sk_pp.StandardScaler, DiffprivlibMixin):
             self.n_samples_seen_ += X.shape[0] - np.isnan(X).sum(axis=0)
         else:
             self.mean_, self.var_, self.n_samples_seen_ = _incremental_mean_and_var(
-                X, epsilon_0, self.bounds, self.mean_, self.var_, self.n_samples_seen_
+                X, epsilon_0, self.bounds, self.mean_, self.var_, self.n_samples_seen_, random_state
             )
 
         # for backward-compatibility, reduce n_samples_seen_ to an integer

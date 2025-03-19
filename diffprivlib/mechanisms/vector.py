@@ -42,7 +42,7 @@ class Vector(DPMechanism):
         The function sensitivity of the mechanism.  Must be in [0, ∞).
 
     data_sensitivity : float, default: 1.0
-        The data sensitivityof the mechanism.  Must be in [0, ∞).
+        The data sensitivity of the mechanism.  Must be in [0, ∞).
 
     dimension : int
         Function input dimension.  This dimension relates to the size of the input vector of the function being
@@ -52,15 +52,22 @@ class Vector(DPMechanism):
     alpha : float, default: 0.01
         Regularisation parameter.  Must be in (0, ∞).
 
+    n : int, default: 1
+        Size of the training dataset, required to calibrate the influence of the random vector in the objective.
+
+    random_state : int or RandomState, optional
+        Controls the randomness of the mechanism.  To obtain a deterministic behaviour during randomisation,
+        ``random_state`` has to be fixed to an integer.
+
     """
-    def __init__(self, *, epsilon, function_sensitivity, data_sensitivity=1.0, dimension, alpha=0.01):
-        super().__init__(epsilon=epsilon, delta=0.0)
+    def __init__(self, *, epsilon, function_sensitivity, data_sensitivity=1.0, dimension, alpha=0.01, n=1,
+                 random_state=None):
+        super().__init__(epsilon=epsilon, delta=0.0, random_state=random_state)
         self.function_sensitivity, self.data_sensitivity = self._check_sensitivity(function_sensitivity,
                                                                                    data_sensitivity)
         self.dimension = self._check_dimension(dimension)
         self.alpha = self._check_alpha(alpha)
-
-        self._rng = np.random.default_rng()
+        self.n = int(n)
 
     @classmethod
     def _check_epsilon_delta(cls, epsilon, delta):
@@ -104,6 +111,9 @@ class Vector(DPMechanism):
         self._check_sensitivity(self.function_sensitivity, self.data_sensitivity)
         self._check_dimension(self.dimension)
 
+        if self.n < 1:
+            raise ValueError(f"n must be strictly positive, got {self.n}")
+
         if not callable(value):
             raise TypeError("Value to be randomised must be a function")
 
@@ -136,21 +146,25 @@ class Vector(DPMechanism):
         """
         self._check_all(value)
 
-        epsilon_p = self.epsilon - 2 * np.log(1 + self.function_sensitivity * self.data_sensitivity /
-                                              (0.5 * self.alpha))
+        epsilon_p = self.epsilon - 2 * np.log(1 + self.function_sensitivity * self.data_sensitivity / self.alpha)
         delta = 0
 
         if epsilon_p <= 0:
-            delta = (self.function_sensitivity * self.data_sensitivity / (np.exp(self.epsilon / 4) - 1)
-                     - 0.5 * self.alpha)
+            delta = (self.function_sensitivity * self.data_sensitivity / np.expm1(self.epsilon / 4)
+                     - self.alpha) / self.n
             epsilon_p = self.epsilon / 2
 
         scale = self.data_sensitivity * 2 / epsilon_p
 
-        normed_noisy_vector = self._rng.standard_normal((self.dimension, 4)).sum(axis=1) / 2
-        norm = np.linalg.norm(normed_noisy_vector, 2)
-        noisy_norm = self._rng.gamma(self.dimension / 4, scale, 4).sum()
+        try:
+            normed_noisy_vector = self._rng.standard_normal((self.dimension, 4)).sum(axis=1) / 2
+            noisy_norm = self._rng.gamma(self.dimension / 4, scale, 4).sum()
+        except AttributeError:  # rng is secrets.SystemRandom
+            normed_noisy_vector = np.reshape([self._rng.normalvariate(0, 1) for _ in range(self.dimension * 4)],
+                                             (-1, 4)).sum(axis=1) / 2
+            noisy_norm = sum(self._rng.gammavariate(self.dimension / 4, scale) for _ in range(4)) if scale > 0 else 0.0
 
+        norm = np.linalg.norm(normed_noisy_vector, 2)
         normed_noisy_vector = normed_noisy_vector / norm * noisy_norm
 
         def output_func(*args):
@@ -163,11 +177,11 @@ class Vector(DPMechanism):
             else:
                 grad = None
 
-            func += np.dot(normed_noisy_vector, input_vec)
+            func += np.dot(normed_noisy_vector, input_vec) / self.n
             func += 0.5 * delta * np.dot(input_vec, input_vec)
 
             if grad is not None:
-                grad += normed_noisy_vector + delta * input_vec
+                grad += normed_noisy_vector / self.n + delta * input_vec
 
                 return func, grad
 

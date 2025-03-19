@@ -23,9 +23,16 @@ import warnings
 import numpy as np
 import sklearn.cluster as sk_cluster
 
+# TODO: remove when sklearn 1.6 a min req
+try:
+    from sklearn.utils.validation import validate_data
+except ImportError:
+    from sklearn.base import BaseEstimator
+    validate_data = BaseEstimator._validate_data
+
 from diffprivlib.accountant import BudgetAccountant
 from diffprivlib.mechanisms import LaplaceBoundedDomain, GeometricFolded
-from diffprivlib.utils import PrivacyLeakWarning
+from diffprivlib.utils import PrivacyLeakWarning, check_random_state
 from diffprivlib.validation import DiffprivlibMixin
 
 
@@ -43,10 +50,14 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
     epsilon : float, default: 1.0
         Privacy parameter :math:`\epsilon`.
 
-    bounds:  tuple, optional
+    bounds :  tuple, optional
         Bounds of the data, provided as a tuple of the form (min, max).  `min` and `max` can either be scalars, covering
         the min/max of the entire data, or vectors with one entry per feature.  If not provided, the bounds are computed
         on the data when ``.fit()`` is first called, resulting in a :class:`.PrivacyLeakWarning`.
+
+    random_state : int or RandomState, optional
+        Controls the randomness of the model.  To obtain a deterministic behaviour during randomisation,
+        ``random_state`` has to be fixed to an integer.
 
     accountant : BudgetAccountant, optional
         Accountant to keep track of privacy budget.
@@ -74,8 +85,11 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
 
     """
 
-    def __init__(self, n_clusters=8, *, epsilon=1.0, bounds=None, accountant=None, **unused_args):
-        super().__init__(n_clusters=n_clusters)
+    _parameter_constraints = DiffprivlibMixin._copy_parameter_constraints(
+        sk_cluster.KMeans, "n_clusters", "random_state")
+
+    def __init__(self, n_clusters=8, *, epsilon=1.0, bounds=None, random_state=None, accountant=None, **unused_args):
+        super().__init__(n_clusters=n_clusters, random_state=random_state)
 
         self.epsilon = epsilon
         self.bounds = bounds
@@ -109,6 +123,7 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
         self : class
 
         """
+        self._validate_params()
         self.accountant.check(self.epsilon, 0)
 
         if sample_weight is not None:
@@ -116,7 +131,9 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
 
         del y
 
-        X = self._validate_data(X, accept_sparse=False, dtype=[np.float64, np.float32])
+        random_state = check_random_state(self.random_state)
+
+        X = validate_data(self, X, accept_sparse=False, dtype=[np.float64, np.float32])
         n_samples, n_dims = X.shape
 
         if n_samples < self.n_clusters:
@@ -133,14 +150,15 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
         self.bounds = self._check_bounds(self.bounds, n_dims, min_separation=1e-5)
         X = self._clip_to_bounds(X, self.bounds)
 
-        centers = self._init_centers(n_dims)
+        centers = self._init_centers(n_dims, random_state=random_state)
         labels = None
         distances = None
 
         # Run _update_centers first to ensure consistency of `labels` and `centers`, since convergence unlikely
         for _ in range(-1, iters):
             if labels is not None:
-                centers = self._update_centers(X, centers=centers, labels=labels, dims=n_dims, total_iters=iters)
+                centers = self._update_centers(X, centers=centers, labels=labels, dims=n_dims, total_iters=iters,
+                                               random_state=random_state)
 
             distances, labels = self._distances_labels(X, centers)
 
@@ -153,7 +171,7 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
 
         return self
 
-    def _init_centers(self, dims):
+    def _init_centers(self, dims, random_state):
         if self.bounds_processed is None:
             bounds_processed = np.zeros(shape=(dims, 2))
 
@@ -175,7 +193,7 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
                 if cluster >= self.n_clusters:
                     break
 
-                temp_center = np.random.random(dims) * (self.bounds_processed[:, 0] - 2 * cluster_proximity) + \
+                temp_center = random_state.random(dims) * (self.bounds_processed[:, 0] - 2 * cluster_proximity) + \
                     self.bounds_processed[:, 1] + cluster_proximity
 
                 if cluster == 0:
@@ -208,7 +226,7 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
         labels = np.argmin(distances, axis=1)
         return distances, labels
 
-    def _update_centers(self, X, centers, labels, dims, total_iters):
+    def _update_centers(self, X, centers, labels, dims, total_iters, random_state):
         """Updates the centers of the KMeans algorithm for the current iteration, while satisfying differential
         privacy.
 
@@ -218,7 +236,8 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
 
         """
         epsilon_0, epsilon_i = self._split_epsilon(dims, total_iters)
-        geometric_mech = GeometricFolded(epsilon=epsilon_0, sensitivity=1, lower=0.5, upper=float("inf"))
+        geometric_mech = GeometricFolded(epsilon=epsilon_0, sensitivity=1, lower=0.5, upper=float("inf"),
+                                         random_state=random_state)
 
         for cluster in range(self.n_clusters):
             if cluster not in labels:
@@ -234,7 +253,7 @@ class KMeans(sk_cluster.KMeans, DiffprivlibMixin):
                 laplace_mech = LaplaceBoundedDomain(epsilon=epsilon_i,
                                                     sensitivity=self.bounds[1][i] - self.bounds[0][i],
                                                     lower=noisy_count * self.bounds[0][i],
-                                                    upper=noisy_count * self.bounds[1][i])
+                                                    upper=noisy_count * self.bounds[1][i], random_state=random_state)
                 noisy_sum[i] = laplace_mech.randomise(cluster_sum[i])
 
             centers[cluster, :] = noisy_sum / noisy_count
